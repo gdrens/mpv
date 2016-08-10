@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -11,12 +12,32 @@ import (
 	"time"
 )
 
+const (
+	EventStartFile       = "start-file"
+	EventTracksChanged   = "tracks-changed"
+	EventMetadataUpdate  = "metadata-update"
+	EventAudioReconfig   = "audio-reconfig"
+	EventVideoReconfig   = "video-reconfig"
+	EventFileLoaded      = "file-loaded"
+	EventPlayBackRestart = "playback-restart"
+	EventEndFile         = "end-file"
+	EventSeek            = "seek"
+	EventShutDown        = "shutdown"
+	EventLogMessage      = "log-message"
+	EventIdle            = "idle"
+	EventClientMessage   = "client-message"
+	EventPropertyChange  = "property-change"
+)
+
+type handleEvent func(resp *Response)
+
 // Response received from mpv. Can be an event or a user requested response.
 type Response struct {
 	Err       string      `json:"error"`
 	Data      interface{} `json:"data"` // May contain float64, bool or string
 	Event     string      `json:"event"`
 	RequestID int         `json:"request_id"`
+	Bytes     []byte      //Raw bytes
 }
 
 // request sent to mpv. Includes request_id for mapping the response.
@@ -24,14 +45,22 @@ type request struct {
 	Command   []interface{}  `json:"command"`
 	RequestID int            `json:"request_id"`
 	Response  chan *Response `json:"-"`
+	RawString string         //Raw string
 }
 
 func newRequest(cmd ...interface{}) *request {
-	return &request{
+	req := &request{
 		Command:   cmd,
 		RequestID: rand.Intn(10000),
 		Response:  make(chan *Response, 1),
 	}
+	if len(cmd) < 2 {
+		return req
+	}
+	if cmd[0].(string) == "raw" {
+		req.RawString = cmd[1].(string)
+	}
+	return req
 }
 
 // LLClient is the most low level interface
@@ -46,7 +75,8 @@ type IPCClient struct {
 	comm    chan *request
 
 	mu     sync.Mutex
-	reqMap map[int]*request // Maps RequestIDs to Requests for response association
+	reqMap map[int]*request       // Maps RequestIDs to Requests for response association
+	event  map[string]handleEvent //Event handle function
 }
 
 // NewIPCClient creates a new IPCClient connected to the given socket.
@@ -56,16 +86,24 @@ func NewIPCClient(socket string) *IPCClient {
 		timeout: 2 * time.Second,
 		comm:    make(chan *request),
 		reqMap:  make(map[int]*request),
+		event:   make(map[string]handleEvent),
 	}
 	c.run()
 	return c
 }
 
+//Register Event Handle Function
+func (c *IPCClient) registerEvent(name string, fn handleEvent) {
+	c.mu.Lock()
+	c.event[name] = fn
+	c.mu.Unlock()
+}
+
 // dispatch dispatches responses to the corresponding request
 func (c *IPCClient) dispatch(resp *Response) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if resp.Event == "" { // No Event
-		c.mu.Lock()
-		defer c.mu.Unlock()
 		if req, ok := c.reqMap[resp.RequestID]; ok { // Lookup requestID in request map
 			delete(c.reqMap, resp.RequestID)
 			req.Response <- resp
@@ -74,6 +112,9 @@ func (c *IPCClient) dispatch(resp *Response) {
 		// Discard response
 	} else { // Event
 		// TODO: Implement Event support
+		if handleFunc, ok := c.event[resp.Event]; ok {
+			handleFunc(resp)
+		}
 	}
 }
 
@@ -103,10 +144,16 @@ func (c *IPCClient) writeloop(conn io.Writer) {
 		c.reqMap[req.RequestID] = req
 		c.mu.Unlock()
 		b = append(b, '\n')
+		if len(req.Command) > 1 && req.Command[0] == "raw" {
+			b = []byte(fmt.Sprintf("{%s,\"%s\":%d}\n", req.RawString, "request_id", req.RequestID))
+		}
 		_, err = conn.Write(b)
 		if err != nil {
 			// TODO: Discard request, maybe send error downstream
 			// TODO: Remove from reqMap?
+			c.mu.Lock()
+			delete(c.reqMap, req.RequestID)
+			c.mu.Unlock()
 		}
 	}
 }
@@ -120,6 +167,8 @@ func (c *IPCClient) readloop(conn io.Reader) {
 			continue
 		}
 		var resp Response
+		resp.Bytes = make([]byte, len(data))
+		copy(resp.Bytes, data)
 		err = json.Unmarshal(data, &resp)
 		if err != nil {
 			// TODO: Handle error
