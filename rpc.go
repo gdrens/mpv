@@ -2,6 +2,8 @@ package mpv
 
 import "net/rpc"
 
+var _ LLClient = (*RPCClient)(nil)
+
 // RPCServer publishes a LLClient over RPC.
 type RPCServer struct {
 	llclient LLClient
@@ -38,4 +40,8 @@ func (s *RPCClient) Exec(command ...interface{}) (*Response, error) {
 	var res Response
 	err := s.client.Call("RPCServer.Exec", &command, &res)
 	return &res, err
+}
+
+func (s *RPCClient) RegisterEvent(name string, handle func()) {
+
 }
